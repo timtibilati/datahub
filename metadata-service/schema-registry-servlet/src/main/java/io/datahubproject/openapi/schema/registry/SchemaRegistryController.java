@@ -1,7 +1,6 @@
 package io.datahubproject.openapi.schema.registry;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.collect.ImmutableSet;
 import com.linkedin.metadata.registry.SchemaRegistryService;
 import io.datahubproject.schema_registry.openapi.generated.CompatibilityCheckResponse;
 import io.datahubproject.schema_registry.openapi.generated.Config;
@@ -22,12 +21,14 @@ import io.swagger.api.SchemasApi;
 import io.swagger.api.SubjectsApi;
 import io.swagger.api.V1Api;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.enums.ParameterIn;
 import jakarta.servlet.http.HttpServletRequest;
-import java.util.Arrays;
+import jakarta.validation.Valid;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
+import java.util.stream.Collectors;
 import javax.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -38,6 +39,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /** DataHub Rest Controller implementation for Confluent's Schema Registry OpenAPI spec. */
@@ -59,8 +61,6 @@ public class SchemaRegistryController
   private final ObjectMapper objectMapper;
 
   private final HttpServletRequest request;
-  private static final Set<String> SCHEMA_VERSIONS =
-      ImmutableSet.of(String.valueOf(Constants.FIXED_SCHEMA_VERSION), "latest");
 
   @Qualifier("schemaRegistryService")
   private final SchemaRegistryService _schemaRegistryService;
@@ -121,28 +121,75 @@ public class SchemaRegistryController
       String subject, String version, Boolean deleted) {
     final String topicName = subject.replaceFirst("-value", "");
 
-    if (!SCHEMA_VERSIONS.contains(version)) {
-      log.error(
-          "[SubjectsApi] getSchemaByVersion subject {} version {} not found.", subject, version);
-      return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+    // Handle "latest" version request
+    if ("latest".equals(version)) {
+      Optional<Integer> latestVersionOpt =
+          _schemaRegistryService.getLatestSchemaVersionForTopic(topicName);
+      if (!latestVersionOpt.isPresent()) {
+        log.error(
+            "[SubjectsApi] getSchemaByVersion couldn't find latest version for topic {}.",
+            topicName);
+        return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+      }
+
+      int latestVersion = latestVersionOpt.get();
+      return _schemaRegistryService
+          .getSchemaForTopicAndVersion(topicName, latestVersion)
+          .map(
+              schema -> {
+                Schema result = new Schema();
+                result.setSubject(subject);
+                result.setVersion(latestVersion);
+                result.setId(_schemaRegistryService.getSchemaIdForTopic(topicName).get());
+                result.setSchema(schema.toString());
+                return new ResponseEntity<>(result, HttpStatus.OK);
+              })
+          .orElseGet(
+              () -> {
+                log.error("[SubjectsApi] getSchemaByVersion couldn't find topic {}.", topicName);
+                return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+              });
     }
 
-    return _schemaRegistryService
-        .getSchemaForTopic(topicName)
-        .map(
-            schema -> {
-              Schema result = new Schema();
-              result.setSubject(subject);
-              result.setVersion(Constants.FIXED_SCHEMA_VERSION);
-              result.setId(_schemaRegistryService.getSchemaIdForTopic(topicName).get());
-              result.setSchema(schema.toString());
-              return new ResponseEntity<>(result, HttpStatus.OK);
-            })
-        .orElseGet(
-            () -> {
-              log.error("[SubjectsApi] getSchemaByVersion couldn't find topic {}.", topicName);
-              return new ResponseEntity<>(HttpStatus.NOT_FOUND);
-            });
+    // Handle specific version request
+    try {
+      int versionNumber = Integer.parseInt(version);
+
+      // Check if this version is supported for the topic
+      Optional<List<Integer>> supportedVersions =
+          _schemaRegistryService.getSupportedSchemaVersionsForTopic(topicName);
+      if (supportedVersions.isPresent() && !supportedVersions.get().contains(versionNumber)) {
+        log.error(
+            "[SubjectsApi] getSchemaByVersion subject {} version {} not supported for topic {}.",
+            subject,
+            version,
+            topicName);
+        return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+      }
+
+      return _schemaRegistryService
+          .getSchemaForTopicAndVersion(topicName, versionNumber)
+          .map(
+              schema -> {
+                Schema result = new Schema();
+                result.setSubject(subject);
+                result.setVersion(versionNumber);
+                result.setId(_schemaRegistryService.getSchemaIdForTopic(topicName).get());
+                result.setSchema(schema.toString());
+                return new ResponseEntity<>(result, HttpStatus.OK);
+              })
+          .orElseGet(
+              () -> {
+                log.error(
+                    "[SubjectsApi] getSchemaByVersion couldn't find topic {} version {}.",
+                    topicName,
+                    version);
+                return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+              });
+    } catch (NumberFormatException e) {
+      log.error("[SubjectsApi] getSchemaByVersion invalid version format: {}", version);
+      return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
+    }
   }
 
   @Override
@@ -153,9 +200,58 @@ public class SchemaRegistryController
 
   @Override
   public ResponseEntity<List<String>> list(
-      String subjectPrefix, Boolean deleted, Boolean deletedOnly) {
-    log.error("[SubjectsApi] list method not implemented");
-    return SubjectsApi.super.list(subjectPrefix, deleted, deletedOnly);
+      @Parameter(
+              in = ParameterIn.QUERY,
+              description = "Subject name prefix",
+              schema = @io.swagger.v3.oas.annotations.media.Schema(defaultValue = ":*:"))
+          @Valid
+          @RequestParam(value = "subjectPrefix", required = false, defaultValue = ":*:")
+          String subjectPrefix,
+      @Parameter(
+              in = ParameterIn.QUERY,
+              description = "Whether to look up deleted subjects",
+              schema = @io.swagger.v3.oas.annotations.media.Schema())
+          @Valid
+          @RequestParam(value = "deleted", required = false)
+          Boolean deleted,
+      @Parameter(
+              in = ParameterIn.QUERY,
+              description = "Whether to return deleted subjects only",
+              schema = @io.swagger.v3.oas.annotations.media.Schema())
+          @Valid
+          @RequestParam(value = "deletedOnly", required = false)
+          Boolean deletedOnly) {
+    // If deletedOnly is true, return empty list since we don't support deleted schemas
+    if (Boolean.TRUE.equals(deletedOnly)) {
+      return ResponseEntity.ok(List.of());
+    }
+
+    // If deleted is true, return empty list since we don't support deleted schemas
+    if (Boolean.TRUE.equals(deleted)) {
+      return ResponseEntity.ok(List.of());
+    }
+
+    // Get all topics and convert them to subjects (add "-value" suffix)
+    List<String> topics = _schemaRegistryService.getAllTopics();
+
+    if (topics == null) {
+      return ResponseEntity.ok(List.of());
+    }
+
+    List<String> subjects =
+        topics.stream()
+            .map(topic -> topic + "-value")
+            .filter(
+                subject -> {
+                  // Handle the special ":*:" default value and null cases
+                  if (subjectPrefix == null || ":*:".equals(subjectPrefix)) {
+                    return true; // Include all subjects
+                  }
+                  return subject.startsWith(subjectPrefix);
+                })
+            .collect(Collectors.toList());
+
+    return ResponseEntity.ok(subjects);
   }
 
   @Override
@@ -163,11 +259,10 @@ public class SchemaRegistryController
       String subject, Boolean deleted, Boolean deletedOnly) {
     final String topicName = subject.replaceFirst("-value", "");
     return _schemaRegistryService
-        .getSchemaForTopic(topicName)
+        .getSupportedSchemaVersionsForTopic(topicName)
         .map(
-            schema -> {
-              return new ResponseEntity<>(
-                  Arrays.asList(Constants.FIXED_SCHEMA_VERSION), HttpStatus.OK);
+            versions -> {
+              return new ResponseEntity<>(versions, HttpStatus.OK);
             })
         .orElseGet(
             () -> {
